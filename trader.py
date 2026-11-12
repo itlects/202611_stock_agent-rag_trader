@@ -37,7 +37,7 @@ def explain(symbol, evidence, llm=False):
     if not evidence:
         raise ValueError('검색 근거 없음: 추천 중단')
     if not llm:
-        return '규칙 기반 분석: 양의 모멘텀 후보. 합성 데이터이며 투자 판단에 사용하지 않음.'
+        return '규칙 기반 분석: 양의 지표 후보. 데이터 출처와 시각을 함께 확인할 것. 수익 예측 모델이 아님.'
     key, model = os.environ.get('OPENAI_API_KEY'), os.environ.get('OPENAI_MODEL')
     if not key or not model:
         raise ValueError('OPENAI_API_KEY와 OPENAI_MODEL을 설정하세요')
@@ -99,14 +99,25 @@ class Store:
 def fill(record):
     spent = 0
     for item in record['orders']:
+        if record.get('data_kind') == 'stream':
+            from market_data import Quote
+            Quote(**item['quote']).assert_fresh_stream()
         risk_check(item['price'], item['qty'], spent)
         spent += item['price'] * item['qty']
     record['state'] = 'paper_filled'
     record['total'] = spent
     return record
 
-def recommend(mode, llm=False):
-    quotes = json.loads((ROOT / 'data/quotes.json').read_text(encoding='utf-8'))
+def recommend(mode, llm=False, cached_quotes=None):
+    if cached_quotes is None:
+        quotes = json.loads((ROOT / 'data/quotes.json').read_text(encoding='utf-8'))
+    else:
+        from dataclasses import asdict
+        quotes = []
+        for q in cached_quotes:
+            q.assert_fresh_stream()
+            quotes.append({'symbol': q.symbol, 'name': q.name or q.symbol, 'price': q.price,
+                           'momentum': q.change_rate / 100, 'quote': asdict(q)})
     orders = []
     for q in sorted(quotes, key=lambda q: q['momentum'], reverse=True):
         if q['momentum'] <= 0:
@@ -117,7 +128,8 @@ def recommend(mode, llm=False):
     if not orders:
         raise ValueError('추천 후보 없음')
     return {'id': str(uuid.uuid4()), 'mode': mode, 'state': 'pending', 'orders': orders,
-            'data_kind': 'synthetic', 'broker': 'local_paper'}
+            'data_kind': 'stream' if cached_quotes is not None else 'synthetic', 'broker': 'local_paper',
+            'ranking_metric': 'day_change_rate' if cached_quotes is not None else 'synthetic_momentum'}
 
 def main():
     load_env()
@@ -128,6 +140,9 @@ def main():
     run = sub.add_parser('run')
     run.add_argument('--mode', choices=['approval', 'auto'], default='approval')
     run.add_argument('--llm', action='store_true')
+    run.add_argument('--quotes-source', choices=['synthetic', 'mysql'], default='synthetic')
+    run.add_argument('--symbols', nargs='+')
+    run.add_argument('--market-source', choices=['kiwoom_ws_mock', 'kiwoom_ws_real'], default='kiwoom_ws_mock')
     approve = sub.add_parser('approve')
     approve.add_argument('id')
     args = parser.parse_args()
@@ -142,7 +157,17 @@ def main():
             if args.command == 'approve':
                 record = store.execute(args.id)
             else:
-                record = recommend(args.mode, args.llm)
+                cached = None
+                if args.quotes_source == 'mysql':
+                    from market_data import QuoteCache
+                    if not args.symbols:
+                        raise ValueError('--quotes-source mysql에는 --symbols가 필요합니다')
+                    cache = QuoteCache()
+                    try:
+                        cached = cache.get(args.symbols, args.market_source)
+                    finally:
+                        cache.close()
+                record = recommend(args.mode, args.llm, cached)
                 store.save(record)
                 if args.mode == 'auto':
                     record = store.execute(record['id'])
